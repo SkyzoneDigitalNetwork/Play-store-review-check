@@ -7,6 +7,8 @@ import time
 import json
 import datetime
 import io
+import base64
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
@@ -37,13 +39,17 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 FIREBASE_CRED_JSON = os.environ["FIREBASE_CREDENTIALS_JSON"]
 ADMIN_IDS          = list(map(int, os.environ.get("ADMIN_IDS", "").split(","))) if os.environ.get("ADMIN_IDS") else []
-GREEN_API_INSTANCE = os.environ["GREEN_API_INSTANCE"]   # REQUIRED — WhatsApp
-GREEN_API_TOKEN    = os.environ["GREEN_API_TOKEN"]       # REQUIRED — WhatsApp
+
+# CallMeBot & ImgBB Environment Variables
+CALLMEBOT_API_KEY  = os.environ.get("CALLMEBOT_API_KEY", "")
+WA_PHONE_NUMBER    = os.environ.get("WA_PHONE_NUMBER", "")
+IMGBB_API_KEY      = os.environ.get("IMGBB_API_KEY", "")
+
 PORT               = int(os.environ.get("PORT", 8080))
 RENDER_URL         = os.environ.get("RENDER_URL", "")
 
 # Conversation states
-WAITING_APP_ID, WAITING_TG_GROUP, WAITING_WA_INVITE = range(3)
+WAITING_APP_ID, WAITING_TG_GROUP = range(2)
 
 # ─── Firebase Init ────────────────────────────────────────
 def init_firebase():
@@ -88,70 +94,45 @@ def start_self_ping():
             time.sleep(240)
     threading.Thread(target=loop, daemon=True).start()
 
-# ─── WhatsApp via Green API ───────────────────────────────
-def wa_join_group(invite_link: str) -> str:
-    """
-    Bot joins WhatsApp group via invite link.
-    Returns group chatId (e.g. 120363XXXXXXXXXX@g.us).
-    """
-    url = (
-        f"https://api.green-api.com/waInstance{GREEN_API_INSTANCE}"
-        f"/joinGroupByInviteLink/{GREEN_API_TOKEN}"
-    )
+# ─── ImgBB API ────────────────────────────────────────────
+def upload_to_imgbb(image_bytes: bytes) -> str:
+    """Uploads screenshot to ImgBB and returns the direct link."""
+    if not IMGBB_API_KEY:
+        logger.warning("⚠️ IMGBB_API_KEY is missing.")
+        return "No link available (API key missing)"
+    
+    url = "https://api.imgbb.com/1/upload"
+    payload = {
+        "key": IMGBB_API_KEY,
+        "image": base64.b64encode(image_bytes).decode('utf-8')
+    }
+    
     try:
-        resp = requests.post(url, json={"inviteLink": invite_link}, timeout=20)
-        data = resp.json()
-        group_id = data.get("groupId", "")
-        if group_id:
-            logger.info(f"✅ Joined WA group: {group_id}")
-            return group_id
-        logger.warning(f"WA join response: {data}")
-        return ""
+        res = requests.post(url, data=payload, timeout=20)
+        res.raise_for_status()
+        data = res.json()
+        logger.info("✅ Image uploaded to ImgBB successfully.")
+        return data["data"]["url"]
     except Exception as e:
-        logger.error(f"❌ WA join failed: {e}")
-        return ""
+        logger.error(f"❌ ImgBB upload failed: {e}")
+        return "Upload failed"
 
-def wa_resolve_group(invite_link: str) -> str:
-    """
-    Resolve group ID from invite link without joining
-    (used as fallback if already a member).
-    """
-    url = (
-        f"https://api.green-api.com/waInstance{GREEN_API_INSTANCE}"
-        f"/checkGroupInviteLink/{GREEN_API_TOKEN}"
-    )
-    try:
-        resp = requests.post(url, json={"inviteLink": invite_link}, timeout=15)
-        return resp.json().get("groupId", "")
-    except Exception as e:
-        logger.error(f"❌ WA resolve failed: {e}")
-        return ""
+# ─── CallMeBot WhatsApp API ───────────────────────────────
+def send_callmebot_wa(text: str):
+    """Send text message to WhatsApp via CallMeBot."""
+    if not CALLMEBOT_API_KEY or not WA_PHONE_NUMBER:
+        logger.warning("⚠️ CallMeBot credentials missing. Cannot send WhatsApp message.")
+        return
 
-def send_wa_image(group_id: str, image_bytes: bytes, caption: str):
-    """Send screenshot image to WhatsApp group."""
-    url = (
-        f"https://api.green-api.com/waInstance{GREEN_API_INSTANCE}"
-        f"/sendFileByUpload/{GREEN_API_TOKEN}"
-    )
+    encoded_text = urllib.parse.quote(text)
+    url = f"https://api.callmebot.com/whatsapp.php?phone={WA_PHONE_NUMBER}&text={encoded_text}&apikey={CALLMEBOT_API_KEY}"
+    
     try:
-        files = {"file": ("review.png", image_bytes, "image/png")}
-        data  = {"chatId": group_id, "caption": caption}
-        r = requests.post(url, files=files, data=data, timeout=30)
-        r.raise_for_status()
-        logger.info(f"✅ WA image sent → {group_id}")
-    except Exception as e:
-        logger.error(f"❌ WA image send failed: {e}")
-
-def send_wa_text(group_id: str, text: str):
-    """Send text message to WhatsApp group."""
-    url = (
-        f"https://api.green-api.com/waInstance{GREEN_API_INSTANCE}"
-        f"/sendMessage/{GREEN_API_TOKEN}"
-    )
-    try:
-        r = requests.post(url, json={"chatId": group_id, "message": text}, timeout=15)
-        r.raise_for_status()
-        logger.info(f"✅ WA text sent → {group_id}")
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            logger.info(f"✅ WA text sent via CallMeBot")
+        else:
+            logger.error(f"❌ WA text send failed with Status: {r.status_code} - {r.text}")
     except Exception as e:
         logger.error(f"❌ WA text send failed: {e}")
 
@@ -159,12 +140,10 @@ def send_wa_text(group_id: str, text: str):
 def get_all_apps():
     return [{"id": d.id, **d.to_dict()} for d in db.collection("apps").stream()]
 
-def save_app(app_id: str, tg_group: str, wa_group_id: str, wa_invite: str):
+def save_app(app_id: str, tg_group: str):
     db.collection("apps").document(app_id).set({
         "app_id":    app_id,
         "tg_group":  tg_group,
-        "wa_group":  wa_group_id,
-        "wa_invite": wa_invite,
         "added_at":  firestore.SERVER_TIMESTAMP,
         "active":    True,
     }, merge=True)
@@ -285,11 +264,10 @@ def get_app_name(app_id: str) -> str:
     except Exception:
         return app_id
 
-# ─── Core Review Checker ──────────────────────────────────
+# ─── Core Review Checker (English Only for Groups) ────────
 async def check_app(bot: Bot, cfg: dict):
     app_id   = cfg["app_id"]
     tg_group = cfg.get("tg_group", "")
-    wa_group = cfg.get("wa_group", "")
     today    = datetime.date.today().isoformat()
 
     logger.info(f"🔍 Checking: {app_id}")
@@ -310,18 +288,18 @@ async def check_app(bot: Bot, cfg: dict):
         if hasattr(at, "strftime"):
             at = at.strftime("%d %b %Y  %I:%M %p")
 
+        # ── Telegram Payload (English) ──
         tg_caption = (
-            f"⭐⭐⭐⭐⭐ *নতুন ৫-স্টার রিভিউ!*\n\n"
+            f"⭐⭐⭐⭐⭐ *New 5-Star Review!*\n\n"
             f"📱 *App:* `{app_name}`\n"
             f"👤 *User:* {review.get('userName','Anonymous')}\n"
             f"🗓 *Date:* {at}\n\n"
             f"💬 *Review:*\n_{review.get('content','')[:300]}_\n\n"
             f"🤖 *AI Summary:* {summary}\n\n"
-            f"📊 *আজকের ৫★ রিভিউ:* {daily}টি"
+            f"📊 *Daily 5★ Reviews:* {daily}"
         )
-        wa_caption = tg_caption.replace("*","").replace("_","").replace("`","")
 
-        # ── Telegram (mandatory) ──
+        # Send to Telegram First
         if tg_group:
             try:
                 await bot.send_photo(
@@ -334,11 +312,21 @@ async def check_app(bot: Bot, cfg: dict):
             except TelegramError as e:
                 logger.error(f"TG error: {e}")
 
-        # ── WhatsApp (mandatory) ──
-        if wa_group:
-            send_wa_image(wa_group, shot, wa_caption)
-        else:
-            logger.warning(f"⚠️ WA group ID missing for {app_id} — screenshot not sent to WA")
+        # ── WhatsApp / ImgBB Payload (English) ──
+        imgbb_url = upload_to_imgbb(shot)
+        
+        wa_text = (
+            f"⭐⭐⭐⭐⭐ *New 5-Star Review!*\n\n"
+            f"📱 *App Name:* {app_name}\n"
+            f"👤 *User Name:* {review.get('userName', 'Anonymous')}\n"
+            f"⭐ *Rating:* {int(review.get('score', 5))} Stars\n\n"
+            f"💬 *Review:*\n{review.get('content', '')[:300]}\n\n"
+            f"🤖 *AI Summary:* {summary}\n\n"
+            f"📊 *Daily 5★ Reviews:* {daily}\n\n"
+            f"🖼️ *Screenshot:* {imgbb_url}"
+        )
+        
+        send_callmebot_wa(wa_text)
 
 async def review_check_job(context: ContextTypes.DEFAULT_TYPE):
     apps = get_all_apps()
@@ -346,35 +334,39 @@ async def review_check_job(context: ContextTypes.DEFAULT_TYPE):
         if cfg.get("active", True):
             await check_app(context.bot, cfg)
 
-# ─── Daily Summary ────────────────────────────────────────
+# ─── Daily Summary (English Only for Groups) ──────────────
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.date.today().isoformat()
     for cfg in get_all_apps():
         app_id   = cfg["app_id"]
         tg_group = cfg.get("tg_group", "")
-        wa_group = cfg.get("wa_group", "")
         count    = get_daily_count(app_id, today)
         name     = get_app_name(app_id)
 
         msg = (
             f"📊 *Daily Summary — {today}*\n\n"
-            f"📱 *App:* `{name}`\n"
-            f"⭐ *আজ ৫-স্টার রিভিউ:* {count}টি\n\n"
-            f"_দারুণ কাজ চালিয়ে যান!_ 🚀"
+            f"📱 *App:* {name}\n"
+            f"⭐ *Today's 5-Star Reviews:* {count}\n\n"
+            f"Keep up the great work! 🚀"
         )
+        
+        # Telegram Summary
         if tg_group:
             try:
-                await context.bot.send_message(tg_group, msg, parse_mode="Markdown")
+                # Add markdown wrappers for Telegram specifically
+                tg_msg = msg.replace(name, f"`{name}`").replace("Keep up the great work!", "_Keep up the great work!_")
+                await context.bot.send_message(tg_group, tg_msg, parse_mode="Markdown")
             except TelegramError as e:
                 logger.error(f"Daily TG error: {e}")
-        if wa_group:
-            send_wa_text(wa_group, msg.replace("*","").replace("_","").replace("`",""))
+                
+        # WhatsApp Summary
+        send_callmebot_wa(msg.replace("*", "")) # CallMeBot uses standard text format, optionally standard WA formatting
 
 # ─── Helpers ──────────────────────────────────────────────
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-# ─── Commands ─────────────────────────────────────────────
+# ─── Commands (Bengali Allowed for Admin/Private Chats) ───
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 *স্বাগতম!*\n\n"
@@ -396,8 +388,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — বটের অবস্থা\n\n"
         "⚙️ *কীভাবে কাজ করে:*\n"
         "• প্রতি ৫ মিনিটে নতুন ৫★ রিভিউ চেক হয়\n"
-        "• Telegram ও WhatsApp দুটোতেই screenshot যায়\n"
-        "• WhatsApp-এ invite link দিলে বট নিজেই join করে\n"
+        "• Telegram ও WhatsApp দুটোতেই alert যায়\n"
         "• রাত ১১:৫৯ তে দৈনিক হিসাব পাঠায়",
         parse_mode="Markdown",
     )
@@ -468,9 +459,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for a in apps:
             lines.append(
                 f"• `{a['app_id']}`\n"
-                f"  📢 TG: `{a.get('tg_group','—')}`\n"
-                f"  💬 WA Group: `{a.get('wa_group','—')}`\n"
-                f"  🔗 Invite: `{a.get('wa_invite','—')}`"
+                f"  📢 TG: `{a.get('tg_group','—')}`"
             )
         await q.edit_message_text("\n".join(lines), parse_mode="Markdown")
 
@@ -484,7 +473,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await daily_summary_job(context)
         await q.edit_message_text("✅ সারসংক্ষেপ পাঠানো হয়েছে!")
 
-# ─── Conversation: Add App (3 steps) ─────────────────────
+# ─── Conversation: Add App (2 steps) ─────────────────────
 async def conv_app_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["app_id"] = update.message.text.strip()
     await update.message.reply_text(
@@ -499,53 +488,17 @@ async def conv_app_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_TG_GROUP
 
 async def conv_tg_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["tg_group"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"✅ Telegram Group: `{context.user_data['tg_group']}`\n\n"
-        f"এখন *WhatsApp Group Invite Link* পাঠান\n"
-        f"_(উদাহরণ: https://chat.whatsapp.com/XXXXXXXXXX)_\n\n"
-        f"💡 Invite link পেতে:\n"
-        f"WhatsApp গ্রুপ → Info → Invite via link\n\n"
-        f"⚙️ বট স্বয়ংক্রিয়ভাবে ঐ গ্রুপে join করবে এবং\n"
-        f"প্রতিটি নতুন রিভিউর screenshot পাঠাবে।",
-        parse_mode="Markdown",
-    )
-    return WAITING_WA_INVITE
-
-async def conv_wa_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    invite_link = update.message.text.strip()
-    app_id      = context.user_data.get("app_id", "")
-    tg_group    = context.user_data.get("tg_group", "")
-
-    msg = await update.message.reply_text("⏳ WhatsApp গ্রুপে join করা হচ্ছে...")
-
-    # Step 1: try joining
-    wa_group_id = wa_join_group(invite_link)
-
-    # Step 2: fallback — resolve without joining (if already a member)
-    if not wa_group_id:
-        wa_group_id = wa_resolve_group(invite_link)
-
-    if wa_group_id:
-        status_text = f"✅ WhatsApp গ্রুপে সফলভাবে join হয়েছে!\nGroup ID: `{wa_group_id}`"
-    else:
-        status_text = (
-            "⚠️ এখনই join করা যায়নি।\n"
-            "Green API instance চালু আছে কিনা চেক করুন।\n"
-            "অ্যাপটি সেভ হয়েছে — পরে /check দিয়ে আবার চেষ্টা করুন।"
-        )
-
-    save_app(app_id, tg_group, wa_group_id, invite_link)
+    tg_group = update.message.text.strip()
+    app_id   = context.user_data.get("app_id", "")
+    
+    save_app(app_id, tg_group)
 
     await update.message.reply_text(
         f"🎉 *অ্যাপ সফলভাবে যোগ হয়েছে!*\n\n"
         f"📱 App ID: `{app_id}`\n"
-        f"📢 Telegram Group: `{tg_group}`\n"
-        f"🔗 WA Invite: `{invite_link}`\n"
-        f"💬 WA Group ID: `{wa_group_id or 'pending'}`\n\n"
-        f"{status_text}\n\n"
+        f"📢 Telegram Group: `{tg_group}`\n\n"
         f"✅ বট এখন থেকে প্রতি *৫ মিনিটে* নতুন ৫★ রিভিউ\n"
-        f"Telegram ও WhatsApp *দুটো গ্রুপেই* পাঠাবে।",
+        f"Telegram এবং আপনার কনফিগার করা WhatsApp নাম্বারে পাঠাবে।",
         parse_mode="Markdown",
     )
     context.user_data.clear()
@@ -566,8 +519,7 @@ async def cmd_listapps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for a in apps:
         lines.append(
             f"• `{a['app_id']}`\n"
-            f"  📢 TG: `{a.get('tg_group','—')}`\n"
-            f"  💬 WA: `{a.get('wa_group','—')}`"
+            f"  📢 TG: `{a.get('tg_group','—')}`"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -598,13 +550,12 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Conversation: Add App (3 steps)
+    # Conversation: Add App
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cb, pattern="^admin_add$")],
         states={
             WAITING_APP_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_app_id)],
             WAITING_TG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_tg_group)],
-            WAITING_WA_INVITE:[MessageHandler(filters.TEXT & ~filters.COMMAND, conv_wa_invite)],
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         per_user=True,
