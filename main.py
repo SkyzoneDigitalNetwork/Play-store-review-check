@@ -49,7 +49,7 @@ PORT               = int(os.environ.get("PORT", 8080))
 RENDER_URL         = os.environ.get("RENDER_URL", "")
 
 # Conversation states
-WAITING_APP_ID, WAITING_TG_GROUP = range(2)
+WAITING_APP_ID, WAITING_TG_GROUP, WAITING_WA_LINK, WAITING_SEARCH_APP, WAITING_SEARCH_DATE = range(5)
 
 # ─── Firebase Init ────────────────────────────────────────
 def init_firebase():
@@ -81,58 +81,42 @@ def start_keep_alive():
     logger.info(f"🌐 Keep-alive server on port {PORT}")
 
 def start_self_ping():
-    """Ping own URL every 4 min so Render never sleeps."""
     def loop():
         if not RENDER_URL:
             return
         while True:
             try:
                 requests.get(RENDER_URL, timeout=10)
-                logger.debug("🔄 Self-pinged")
-            except Exception as e:
-                logger.warning(f"Self-ping failed: {e}")
+            except Exception:
+                pass
             time.sleep(240)
     threading.Thread(target=loop, daemon=True).start()
 
 # ─── ImgBB API ────────────────────────────────────────────
 def upload_to_imgbb(image_bytes: bytes) -> str:
-    """Uploads screenshot to ImgBB and returns the direct link."""
     if not IMGBB_API_KEY:
-        logger.warning("⚠️ IMGBB_API_KEY is missing.")
         return "No link available (API key missing)"
-    
     url = "https://api.imgbb.com/1/upload"
     payload = {
         "key": IMGBB_API_KEY,
         "image": base64.b64encode(image_bytes).decode('utf-8')
     }
-    
     try:
         res = requests.post(url, data=payload, timeout=20)
         res.raise_for_status()
-        data = res.json()
-        logger.info("✅ Image uploaded to ImgBB successfully.")
-        return data["data"]["url"]
+        return res.json()["data"]["url"]
     except Exception as e:
         logger.error(f"❌ ImgBB upload failed: {e}")
         return "Upload failed"
 
 # ─── CallMeBot WhatsApp API ───────────────────────────────
 def send_callmebot_wa(text: str):
-    """Send text message to WhatsApp via CallMeBot."""
     if not CALLMEBOT_API_KEY or not WA_PHONE_NUMBER:
-        logger.warning("⚠️ CallMeBot credentials missing. Cannot send WhatsApp message.")
         return
-
     encoded_text = urllib.parse.quote(text)
     url = f"https://api.callmebot.com/whatsapp.php?phone={WA_PHONE_NUMBER}&text={encoded_text}&apikey={CALLMEBOT_API_KEY}"
-    
     try:
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            logger.info(f"✅ WA text sent via CallMeBot")
-        else:
-            logger.error(f"❌ WA text send failed with Status: {r.status_code} - {r.text}")
+        requests.get(url, timeout=15)
     except Exception as e:
         logger.error(f"❌ WA text send failed: {e}")
 
@@ -140,10 +124,11 @@ def send_callmebot_wa(text: str):
 def get_all_apps():
     return [{"id": d.id, **d.to_dict()} for d in db.collection("apps").stream()]
 
-def save_app(app_id: str, tg_group: str):
+def save_app(app_id: str, tg_group: str, wa_link: str):
     db.collection("apps").document(app_id).set({
         "app_id":    app_id,
         "tg_group":  tg_group,
+        "wa_link":   wa_link,
         "added_at":  firestore.SERVER_TIMESTAMP,
         "active":    True,
     }, merge=True)
@@ -151,12 +136,21 @@ def save_app(app_id: str, tg_group: str):
 def delete_app(app_id: str):
     db.collection("apps").document(app_id).delete()
 
-def is_review_seen(app_id: str, review_id: str) -> bool:
-    return db.collection("seen_reviews").document(f"{app_id}_{review_id}").get().exists
+def check_review_status(app_id: str, review_id: str, content: str) -> str:
+    """Returns 'NEW', 'DUPLICATE', or 'UPDATED'"""
+    doc_ref = db.collection("seen_reviews").document(f"{app_id}_{review_id}")
+    doc = doc_ref.get()
+    if doc.exists:
+        old_content = doc.to_dict().get("content", "")
+        if old_content != content:
+            return "UPDATED"
+        return "DUPLICATE"
+    return "NEW"
 
-def mark_review_seen(app_id: str, review_id: str, date_str: str):
+def mark_review_seen(app_id: str, review_id: str, date_str: str, content: str):
     db.collection("seen_reviews").document(f"{app_id}_{review_id}").set({
         "app_id": app_id, "review_id": review_id,
+        "content": content,
         "date": date_str, "seen_at": firestore.SERVER_TIMESTAMP,
     })
 
@@ -242,16 +236,15 @@ def ai_summary(content: str) -> str:
             temperature=0.5,
         )
         return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.warning(f"Groq failed: {e}")
+    except Exception:
         return content[:180]
 
 # ─── Play Store Fetch ─────────────────────────────────────
-def fetch_reviews(app_id: str) -> list:
+def fetch_reviews(app_id: str, count=100) -> list:
     try:
         result, _ = gps.reviews(
             app_id, lang="en", country="us",
-            sort=gps.Sort.NEWEST, count=50, filter_score_with=5,
+            sort=gps.Sort.NEWEST, count=count, filter_score_with=5,
         )
         return result
     except Exception as e:
@@ -265,41 +258,64 @@ def get_app_name(app_id: str) -> str:
         return app_id
 
 # ─── Core Review Checker (English Only for Groups) ────────
-async def check_app(bot: Bot, cfg: dict):
+async def check_app(bot: Bot, cfg: dict, target_date: str = None):
     app_id   = cfg["app_id"]
     tg_group = cfg.get("tg_group", "")
-    today    = datetime.date.today().isoformat()
+    
+    # If no target_date is provided, use today's date
+    search_date = target_date if target_date else datetime.date.today().isoformat()
+    is_custom_search = target_date is not None
 
-    logger.info(f"🔍 Checking: {app_id}")
-    reviews  = fetch_reviews(app_id)
+    logger.info(f"🔍 Checking: {app_id} for date: {search_date}")
+    reviews  = fetch_reviews(app_id, count=300 if is_custom_search else 50)
     app_name = get_app_name(app_id)
+    
+    found_any = False
 
     for review in reviews:
         rid = review.get("reviewId", "")
-        if not rid or is_review_seen(app_id, rid):
+        content = review.get("content", "").strip()
+        
+        # Date filtering: Only process reviews matching the search date
+        rev_datetime = review.get("at")
+        if rev_datetime and rev_datetime.date().isoformat() != search_date:
+            continue
+            
+        if not rid:
             continue
 
-        mark_review_seen(app_id, rid, today)
-        daily   = increment_daily_count(app_id, today)
-        shot    = generate_screenshot(review, app_name)
-        summary = ai_summary(review.get("content", ""))
+        status = check_review_status(app_id, rid, content)
+        
+        # Ignore exactly duplicate reviews. Proceed only if NEW or UPDATED.
+        if status == "DUPLICATE":
+            continue
 
-        at = review.get("at", "")
-        if hasattr(at, "strftime"):
-            at = at.strftime("%d %b %Y  %I:%M %p")
+        found_any = True
+        mark_review_seen(app_id, rid, search_date, content)
+        
+        # Only increment daily count for today's normal checks
+        daily = increment_daily_count(app_id, search_date) if not is_custom_search else "N/A (Custom Search)"
+        
+        shot    = generate_screenshot(review, app_name)
+        summary = ai_summary(content)
+
+        at_str = rev_datetime.strftime("%d %b %Y  %I:%M %p") if hasattr(rev_datetime, "strftime") else ""
+
+        # Update Notice
+        update_tag = "🔄 *[Updated/Edited Review]*\n\n" if status == "UPDATED" else ""
 
         # ── Telegram Payload (English) ──
         tg_caption = (
+            f"{update_tag}"
             f"⭐⭐⭐⭐⭐ *New 5-Star Review!*\n\n"
             f"📱 *App:* `{app_name}`\n"
             f"👤 *User:* {review.get('userName','Anonymous')}\n"
-            f"🗓 *Date:* {at}\n\n"
-            f"💬 *Review:*\n_{review.get('content','')[:300]}_\n\n"
+            f"🗓 *Date:* {at_str}\n\n"
+            f"💬 *Review:*\n_{content[:300]}_\n\n"
             f"🤖 *AI Summary:* {summary}\n\n"
             f"📊 *Daily 5★ Reviews:* {daily}"
         )
 
-        # Send to Telegram First
         if tg_group:
             try:
                 await bot.send_photo(
@@ -308,7 +324,6 @@ async def check_app(bot: Bot, cfg: dict):
                     caption=tg_caption,
                     parse_mode="Markdown",
                 )
-                logger.info(f"📤 TG sent → {tg_group}")
             except TelegramError as e:
                 logger.error(f"TG error: {e}")
 
@@ -316,80 +331,66 @@ async def check_app(bot: Bot, cfg: dict):
         imgbb_url = upload_to_imgbb(shot)
         
         wa_text = (
+            f"{update_tag.replace('*', '')}"
             f"⭐⭐⭐⭐⭐ *New 5-Star Review!*\n\n"
             f"📱 *App Name:* {app_name}\n"
             f"👤 *User Name:* {review.get('userName', 'Anonymous')}\n"
             f"⭐ *Rating:* {int(review.get('score', 5))} Stars\n\n"
-            f"💬 *Review:*\n{review.get('content', '')[:300]}\n\n"
+            f"💬 *Review:*\n{content[:300]}\n\n"
             f"🤖 *AI Summary:* {summary}\n\n"
             f"📊 *Daily 5★ Reviews:* {daily}\n\n"
             f"🖼️ *Screenshot:* {imgbb_url}"
         )
-        
         send_callmebot_wa(wa_text)
+        
+    return found_any
 
 async def review_check_job(context: ContextTypes.DEFAULT_TYPE):
     apps = get_all_apps()
     for cfg in apps:
         if cfg.get("active", True):
-            await check_app(context.bot, cfg)
+            await check_app(context.bot, cfg) # target_date defaults to today
 
-# ─── Daily Summary (English Only for Groups) ──────────────
+# ─── Daily Summary (12:01 AM for Previous Day) ────────────
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.date.today().isoformat()
+    # Since it runs at 00:01, we want the summary of yesterday
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    
     for cfg in get_all_apps():
         app_id   = cfg["app_id"]
         tg_group = cfg.get("tg_group", "")
-        count    = get_daily_count(app_id, today)
+        count    = get_daily_count(app_id, yesterday)
         name     = get_app_name(app_id)
 
         msg = (
-            f"📊 *Daily Summary — {today}*\n\n"
+            f"📊 *Daily Summary — {yesterday}*\n\n"
             f"📱 *App:* {name}\n"
-            f"⭐ *Today's 5-Star Reviews:* {count}\n\n"
+            f"⭐ *Total 5-Star Reviews:* {count}\n\n"
             f"Keep up the great work! 🚀"
         )
         
-        # Telegram Summary
         if tg_group:
             try:
-                # Add markdown wrappers for Telegram specifically
                 tg_msg = msg.replace(name, f"`{name}`").replace("Keep up the great work!", "_Keep up the great work!_")
                 await context.bot.send_message(tg_group, tg_msg, parse_mode="Markdown")
             except TelegramError as e:
-                logger.error(f"Daily TG error: {e}")
-                
-        # WhatsApp Summary
-        send_callmebot_wa(msg.replace("*", "")) # CallMeBot uses standard text format, optionally standard WA formatting
+                pass
+        send_callmebot_wa(msg.replace("*", ""))
 
 # ─── Helpers ──────────────────────────────────────────────
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-# ─── Commands (Bengali Allowed for Admin/Private Chats) ───
+def get_back_kb():
+    return [InlineKeyboardButton("⬅️ Back", callback_data="admin_main")]
+
+# ─── Commands (Bengali for Admin/Private Chats) ───────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 *স্বাগতম!*\n\n"
         f"আমি আপনার *Play Store Review Monitor Bot* 🤖\n\n"
         f"/admin — Admin প্যানেল\n"
-        f"/listapps — মনিটরড অ্যাপ\n"
-        f"/status — বটের অবস্থা\n"
-        f"/help — সাহায্য",
-        parse_mode="Markdown",
-    )
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Help*\n\n"
-        "/admin — Admin প্যানেল খুলুন\n"
-        "/listapps — সব অ্যাপ দেখুন\n"
-        "/check — এখনই রিভিউ চেক করুন\n"
-        "/summary — দৈনিক সারসংক্ষেপ এখনই পাঠান\n"
-        "/status — বটের অবস্থা\n\n"
-        "⚙️ *কীভাবে কাজ করে:*\n"
-        "• প্রতি ৫ মিনিটে নতুন ৫★ রিভিউ চেক হয়\n"
-        "• Telegram ও WhatsApp দুটোতেই alert যায়\n"
-        "• রাত ১১:৫৯ তে দৈনিক হিসাব পাঠায়",
+        f"/status — বটের অবস্থা",
         parse_mode="Markdown",
     )
 
@@ -411,8 +412,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ অ্যাপ যোগ করুন",    callback_data="admin_add")],
         [InlineKeyboardButton("🗑 অ্যাপ সরান",         callback_data="admin_remove")],
         [InlineKeyboardButton("📋 অ্যাপ তালিকা",       callback_data="admin_list")],
-        [InlineKeyboardButton("🔍 এখনই চেক করুন",     callback_data="admin_check")],
-        [InlineKeyboardButton("📊 দৈনিক সারসংক্ষেপ",  callback_data="admin_summary")],
+        [InlineKeyboardButton("🔍 নির্দিষ্ট অ্যাপ চেক",   callback_data="admin_check_menu")],
+        [InlineKeyboardButton("📅 নির্দিষ্ট তারিখ সার্চ", callback_data="admin_search_menu")],
     ]
     await update.message.reply_text(
         "🛡 *Admin প্যানেল*\nএকটি অপশন বেছে নিন:",
@@ -421,12 +422,28 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q    = update.callback_query
+    q = update.callback_query
     await q.answer()
     data = q.data
 
     if not is_admin(q.from_user.id):
         await q.edit_message_text("❌ Admin only.")
+        return
+
+    # Main Menu Back Button Handle
+    if data == "admin_main":
+        kb = [
+            [InlineKeyboardButton("➕ অ্যাপ যোগ করুন",    callback_data="admin_add")],
+            [InlineKeyboardButton("🗑 অ্যাপ সরান",         callback_data="admin_remove")],
+            [InlineKeyboardButton("📋 অ্যাপ তালিকা",       callback_data="admin_list")],
+            [InlineKeyboardButton("🔍 নির্দিষ্ট অ্যাপ চেক",   callback_data="admin_check_menu")],
+            [InlineKeyboardButton("📅 নির্দিষ্ট তারিখ সার্চ", callback_data="admin_search_menu")],
+        ]
+        await q.edit_message_text(
+            "🛡 *Admin প্যানেল*\nএকটি অপশন বেছে নিন:",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
         return
 
     if data == "admin_add":
@@ -441,103 +458,148 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_remove":
         apps = get_all_apps()
         if not apps:
-            await q.edit_message_text("কোনো অ্যাপ নেই।")
+            await q.edit_message_text("কোনো অ্যাপ নেই।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
             return
         kb = [[InlineKeyboardButton(f"🗑 {a['app_id']}", callback_data=f"del_{a['app_id']}")] for a in apps]
+        kb.append(get_back_kb())
         await q.edit_message_text("কোন অ্যাপটি সরাবেন?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("del_"):
         delete_app(data[4:])
-        await q.edit_message_text(f"✅ `{data[4:]}` সরানো হয়েছে।", parse_mode="Markdown")
+        await q.edit_message_text(f"✅ `{data[4:]}` সরানো হয়েছে।", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
 
     elif data == "admin_list":
         apps = get_all_apps()
         if not apps:
-            await q.edit_message_text("কোনো অ্যাপ যোগ করা হয়নি।")
+            await q.edit_message_text("কোনো অ্যাপ যোগ করা হয়নি।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
             return
         lines = ["📋 *মনিটরড অ্যাপসমূহ:*\n"]
         for a in apps:
             lines.append(
                 f"• `{a['app_id']}`\n"
-                f"  📢 TG: `{a.get('tg_group','—')}`"
+                f"  📢 TG: `{a.get('tg_group','—')}`\n"
+                f"  💬 WA: `{a.get('wa_link','—')}`"
             )
-        await q.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
 
-    elif data == "admin_check":
-        await q.edit_message_text("🔍 চেক করা হচ্ছে...")
-        for cfg in get_all_apps():
-            await check_app(context.bot, cfg)
-        await q.edit_message_text("✅ চেক সম্পন্ন!")
+    # --- Individual App Check System ---
+    elif data == "admin_check_menu":
+        apps = get_all_apps()
+        if not apps:
+            await q.edit_message_text("কোনো অ্যাপ নেই।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+            return
+        kb = [[InlineKeyboardButton(f"🔍 {a['app_id']}", callback_data=f"chk_{a['app_id']}")] for a in apps]
+        kb.append(get_back_kb())
+        await q.edit_message_text("কোন অ্যাপটি চেক করতে চান?", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif data == "admin_summary":
-        await daily_summary_job(context)
-        await q.edit_message_text("✅ সারসংক্ষেপ পাঠানো হয়েছে!")
+    elif data.startswith("chk_"):
+        app_id = data[4:]
+        await q.edit_message_text(f"⏳ `{app_id}` এর আজকের নতুন রিভিউ চেক করা হচ্ছে...", parse_mode="Markdown")
+        
+        apps = get_all_apps()
+        cfg = next((item for item in apps if item["app_id"] == app_id), None)
+        if cfg:
+            found = await check_app(context.bot, cfg) # Checks for today by default
+            if found:
+                await q.edit_message_text(f"✅ `{app_id}` এর নতুন রিভিউ সফলভাবে গ্রুপে পাঠানো হয়েছে।", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+            else:
+                await q.edit_message_text(f"ℹ️ `{app_id}` এ আজকে নতুন কোনো রিভিউ পাওয়া যায়নি।", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+        else:
+            await q.edit_message_text("❌ অ্যাপটি খুঁজে পাওয়া যায়নি।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
 
-# ─── Conversation: Add App (2 steps) ─────────────────────
+    # --- Specific Date Search System ---
+    elif data == "admin_search_menu":
+        apps = get_all_apps()
+        if not apps:
+            await q.edit_message_text("কোনো অ্যাপ নেই।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+            return
+        kb = [[InlineKeyboardButton(f"📅 {a['app_id']}", callback_data=f"srch_{a['app_id']}")] for a in apps]
+        kb.append(get_back_kb())
+        await q.edit_message_text("কোন অ্যাপের জন্য নির্দিষ্ট তারিখ সার্চ করবেন?", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("srch_"):
+        context.user_data["search_app"] = data[5:]
+        await q.edit_message_text(
+            f"📅 অ্যাপ: `{context.user_data['search_app']}`\n\n"
+            f"দয়া করে সার্চ করার **তারিখ** পাঠান।\n"
+            f"ফরম্যাট: `YYYY-MM-DD` (যেমন: `2024-05-20`)\n\n"
+            f"_বাতিল করতে /cancel_",
+            parse_mode="Markdown"
+        )
+        return WAITING_SEARCH_DATE
+
+# ─── Conversation: Search By Date ────────────────────────
+async def conv_search_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_str = update.message.text.strip()
+    app_id = context.user_data.get("search_app")
+    
+    # Simple Date Format validation
+    try:
+        datetime.datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError:
+        await update.message.reply_text("❌ তারিখের ফরম্যাট ভুল! দয়া করে `YYYY-MM-DD` ফরম্যাটে লিখুন (যেমন: 2024-05-20)। /cancel দিয়ে বের হতে পারেন।")
+        return WAITING_SEARCH_DATE
+
+    await update.message.reply_text(f"⏳ `{app_id}` এর `{date_str}` তারিখের রিভিউ খোঁজা হচ্ছে...", parse_mode="Markdown")
+    
+    apps = get_all_apps()
+    cfg = next((item for item in apps if item["app_id"] == app_id), None)
+    
+    if cfg:
+        found = await check_app(context.bot, cfg, target_date=date_str)
+        if found:
+            await update.message.reply_text(f"✅ `{date_str}` তারিখের রিভিউগুলো সফলভাবে গ্রুপে পাঠানো হয়েছে।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+        else:
+            await update.message.reply_text(f"ℹ️ `{date_str}` তারিখে কোনো ৫-স্টার রিভিউ পাওয়া যায়নি বা আগেই পাঠানো হয়েছে।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ─── Conversation: Add App (3 steps) ─────────────────────
 async def conv_app_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["app_id"] = update.message.text.strip()
     await update.message.reply_text(
         f"✅ App ID: `{context.user_data['app_id']}`\n\n"
         f"এখন *Telegram Group ID* পাঠান\n"
-        f"_(উদাহরণ: -1001234567890)_\n\n"
-        f"💡 Group ID পেতে:\n"
-        f"গ্রুপ থেকে @userinfobot এ যেকোনো মেসেজ forward করুন।\n"
-        f"⚠️ বটকে গ্রুপে admin করতে ভুলবেন না!",
+        f"_(উদাহরণ: -1001234567890)_",
         parse_mode="Markdown",
     )
     return WAITING_TG_GROUP
 
 async def conv_tg_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_group = update.message.text.strip()
+    context.user_data["tg_group"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Telegram Group: `{context.user_data['tg_group']}`\n\n"
+        f"এখন *WhatsApp Group Link* পাঠান\n"
+        f"_(উদাহরণ: https://chat.whatsapp.com/IiJk...)_",
+        parse_mode="Markdown",
+    )
+    return WAITING_WA_LINK
+
+async def conv_wa_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wa_link  = update.message.text.strip()
+    tg_group = context.user_data.get("tg_group", "")
     app_id   = context.user_data.get("app_id", "")
     
-    save_app(app_id, tg_group)
+    save_app(app_id, tg_group, wa_link)
 
     await update.message.reply_text(
         f"🎉 *অ্যাপ সফলভাবে যোগ হয়েছে!*\n\n"
         f"📱 App ID: `{app_id}`\n"
-        f"📢 Telegram Group: `{tg_group}`\n\n"
-        f"✅ বট এখন থেকে প্রতি *৫ মিনিটে* নতুন ৫★ রিভিউ\n"
-        f"Telegram এবং আপনার কনফিগার করা WhatsApp নাম্বারে পাঠাবে।",
+        f"📢 Telegram Group: `{tg_group}`\n"
+        f"💬 WA Link Saved: `{wa_link}`\n\n"
+        f"✅ বট এখন থেকে শুধু **আজকের** নতুন ৫★ রিভিউগুলো Telegram এবং আপনার কনফিগার করা WhatsApp নাম্বারে পাঠাবে।\n\n"
+        f"*(নোট: CallMeBot API সরাসরি গ্রুপ লিংকে মেসেজ পাঠাতে পারে না, এটি আপনার সংযুক্ত পার্সোনাল নাম্বারে মেসেজটি পাঠাবে। লিংকটি ডাটাবেসে সেভ রাখা হয়েছে ভবিষ্যতের আপডেটের জন্য।)*",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([get_back_kb()])
     )
     context.user_data.clear()
     return ConversationHandler.END
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ বাতিল করা হয়েছে।")
+    await update.message.reply_text("❌ বাতিল করা হয়েছে।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
     return ConversationHandler.END
-
-# ─── Other Commands ───────────────────────────────────────
-async def cmd_listapps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    apps = get_all_apps()
-    if not apps:
-        await update.message.reply_text("কোনো অ্যাপ যোগ করা হয়নি। /admin → অ্যাপ যোগ করুন।")
-        return
-    lines = ["📋 *মনিটরড অ্যাপসমূহ:*\n"]
-    for a in apps:
-        lines.append(
-            f"• `{a['app_id']}`\n"
-            f"  📢 TG: `{a.get('tg_group','—')}`"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    await update.message.reply_text("🔍 চেক করা হচ্ছে...")
-    for cfg in get_all_apps():
-        await check_app(context.bot, cfg)
-    await update.message.reply_text("✅ চেক সম্পন্ন!")
-
-async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    await daily_summary_job(context)
-    await update.message.reply_text("✅ সারসংক্ষেপ পাঠানো হয়েছে!")
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}", exc_info=True)
@@ -550,12 +612,17 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Conversation: Add App
+    # Conversation: Manage States
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_cb, pattern="^admin_add$")],
+        entry_points=[
+            CallbackQueryHandler(admin_cb, pattern="^admin_add$"),
+            CallbackQueryHandler(admin_cb, pattern="^srch_.*$")
+        ],
         states={
-            WAITING_APP_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_app_id)],
-            WAITING_TG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_tg_group)],
+            WAITING_APP_ID:      [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_app_id)],
+            WAITING_TG_GROUP:    [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_tg_group)],
+            WAITING_WA_LINK:     [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_wa_link)],
+            WAITING_SEARCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_search_date)],
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         per_user=True,
@@ -563,18 +630,16 @@ def main():
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("admin",    cmd_admin))
-    app.add_handler(CommandHandler("listapps", cmd_listapps))
-    app.add_handler(CommandHandler("check",    cmd_check))
-    app.add_handler(CommandHandler("summary",  cmd_summary))
     app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("admin",    cmd_admin))
     app.add_handler(CallbackQueryHandler(admin_cb))
     app.add_error_handler(error_handler)
 
     jq = app.job_queue
+    # 5 minutes auto check
     jq.run_repeating(review_check_job, interval=300, first=30, name="review_check")
-    jq.run_daily(daily_summary_job, time=datetime.time(23, 59, 0), name="daily_summary")
+    # Daily summary exactly at 12:01 AM (00:01:00)
+    jq.run_daily(daily_summary_job, time=datetime.time(0, 1, 0), name="daily_summary")
 
     logger.info("✅ Bot polling শুরু হয়েছে!")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
