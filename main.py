@@ -9,13 +9,16 @@ import datetime
 import io
 import base64
 import urllib.parse
+import hashlib
+import csv
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
+import pytz
 from PIL import Image, ImageDraw, ImageFont
 import google_play_scraper as gps
 from telegram import (
-    Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+    Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -34,19 +37,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ReviewBot")
 
-# ─── Environment Variables ────────────────────────────────
+# ─── Environment Variables & Timezone ─────────────────────
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 FIREBASE_CRED_JSON = os.environ["FIREBASE_CREDENTIALS_JSON"]
 ADMIN_IDS          = list(map(int, os.environ.get("ADMIN_IDS", "").split(","))) if os.environ.get("ADMIN_IDS") else []
 
-# CallMeBot & ImgBB Environment Variables
 CALLMEBOT_API_KEY  = os.environ.get("CALLMEBOT_API_KEY", "")
 WA_PHONE_NUMBER    = os.environ.get("WA_PHONE_NUMBER", "")
 IMGBB_API_KEY      = os.environ.get("IMGBB_API_KEY", "")
 
 PORT               = int(os.environ.get("PORT", 8080))
 RENDER_URL         = os.environ.get("RENDER_URL", "")
+
+# Bangladesh Timezone
+BD_TZ = pytz.timezone("Asia/Dhaka")
 
 # Conversation states
 WAITING_APP_ID, WAITING_TG_GROUP, WAITING_WA_LINK, WAITING_SEARCH_APP, WAITING_SEARCH_DATE = range(5)
@@ -60,8 +65,6 @@ def init_firebase():
     return firestore.client()
 
 db = init_firebase()
-
-# ─── Groq AI ──────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ─── Keep-Alive HTTP Server (Render 24/7) ─────────────────
@@ -137,21 +140,38 @@ def delete_app(app_id: str):
     db.collection("apps").document(app_id).delete()
 
 def check_review_status(app_id: str, review_id: str, content: str) -> str:
-    """Returns 'NEW', 'DUPLICATE', or 'UPDATED'"""
+    """Returns 'NEW', 'DUPLICATE_ID', or 'UPDATED'"""
     doc_ref = db.collection("seen_reviews").document(f"{app_id}_{review_id}")
     doc = doc_ref.get()
     if doc.exists:
         old_content = doc.to_dict().get("content", "")
         if old_content != content:
             return "UPDATED"
-        return "DUPLICATE"
+        return "DUPLICATE_ID"
     return "NEW"
 
-def mark_review_seen(app_id: str, review_id: str, date_str: str, content: str):
+def check_and_mark_duplicate_text(app_id: str, content: str) -> bool:
+    """Check if exact text is used in another review (Duplicate Text Alert)"""
+    if not content or len(content.strip()) < 5:
+        return False
+    content_hash = hashlib.md5(content.strip().lower().encode('utf-8')).hexdigest()
+    doc_ref = db.collection("text_hashes").document(f"{app_id}_{content_hash}")
+    if doc_ref.get().exists:
+        return True
+    doc_ref.set({"exists": True, "created_at": firestore.SERVER_TIMESTAMP})
+    return False
+
+def save_full_review_data(app_id: str, review_id: str, user_name: str, content: str, original_date: str, processed_date: str, imgbb_url: str, is_dup_text: bool):
     db.collection("seen_reviews").document(f"{app_id}_{review_id}").set({
-        "app_id": app_id, "review_id": review_id,
+        "app_id": app_id, 
+        "review_id": review_id,
+        "user_name": user_name,
         "content": content,
-        "date": date_str, "seen_at": firestore.SERVER_TIMESTAMP,
+        "original_date": original_date,
+        "processed_date": processed_date, # Date it was caught by bot (BD Time)
+        "imgbb_url": imgbb_url,
+        "is_duplicate_text": is_dup_text,
+        "seen_at": firestore.SERVER_TIMESTAMP,
     })
 
 def increment_daily_count(app_id: str, date_str: str) -> int:
@@ -165,58 +185,57 @@ def get_daily_count(app_id: str, date_str: str) -> int:
     doc = db.collection("daily_counts").document(f"{app_id}_{date_str}").get()
     return doc.to_dict().get("count", 0) if doc.exists else 0
 
-# ─── Screenshot Generator ─────────────────────────────────
+# ─── Screenshot Generator (Clean Play Store UI) ───────────
 def generate_screenshot(review: dict, app_name: str) -> bytes:
-    W, H = 800, 430
-    img  = Image.new("RGB", (W, H), (245, 248, 255))
+    W, H = 800, 360  # Reduced height, removed bottom texts
+    img  = Image.new("RGB", (W, H), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
-    draw.rounded_rectangle([18, 18, W-18, H-18], radius=20, fill=(210, 218, 240))
-    draw.rounded_rectangle([14, 14, W-14, H-14], radius=20, fill=(255, 255, 255))
-    draw.rounded_rectangle([14, 14, W-14, 68],   radius=20, fill=(48, 63, 159))
-    draw.rectangle([14, 48, W-14, 68], fill=(48, 63, 159))
+    # Simple clean borders
+    draw.rectangle([0, 0, W, 70], fill=(255, 255, 255))
+    draw.line([(0, 70), (W, 70)], fill=(230, 230, 230), width=1)
 
     try:
         fb = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
         fr = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        f_app   = ImageFont.truetype(fb, 22)
         f_big   = ImageFont.truetype(fb, 20)
-        f_med   = ImageFont.truetype(fr, 16)
-        f_small = ImageFont.truetype(fr, 13)
+        f_med   = ImageFont.truetype(fr, 17)
+        f_small = ImageFont.truetype(fr, 14)
     except Exception:
-        f_big = f_med = f_small = ImageFont.load_default()
+        f_app = f_big = f_med = f_small = ImageFont.load_default()
 
-    draw.text((28, 28), f"📱  {app_name}", fill=(255, 255, 255), font=f_big)
-
-    score = int(review.get("score", 5))
-    draw.text((28, 82), "★" * score + "☆" * (5 - score), fill=(255, 193, 7), font=f_big)
+    draw.text((28, 25), f"{app_name}", fill=(32, 33, 36), font=f_app)
 
     user = review.get("userName", "Anonymous")
-    at   = review.get("at", "")
+    draw.text((28, 95), f"{user}", fill=(32, 33, 36), font=f_med)
+    
+    score = int(review.get("score", 5))
+    draw.text((28, 130), "★" * score + "☆" * (5 - score), fill=(1, 135, 95), font=f_big) # Play store green star color
+
+    at = review.get("at", "")
     if hasattr(at, "strftime"):
-        at = at.strftime("%d %b %Y  %I:%M %p")
-    draw.text((28, 120),    f"👤  {user}", fill=(30, 30, 50),    font=f_med)
-    draw.text((W-230, 120), f"🗓  {at}",   fill=(100, 110, 130), font=f_small)
-    draw.line([(28, 152), (W-28, 152)], fill=(220, 225, 240), width=2)
+        at = at.strftime("%d %b %Y")
+    draw.text((150, 134), f"{at}", fill=(95, 99, 104), font=f_small)
 
     content = review.get("content", "").strip() or "(No text)"
     words, lines, cur = content.split(), [], ""
     for w in words:
-        if len(cur) + len(w) + 1 > 82:
+        if len(cur) + len(w) + 1 > 85:
             lines.append(cur); cur = w
         else:
             cur = (cur + " " + w).strip()
     if cur:
         lines.append(cur)
-    y = 165
-    for ln in lines[:6]:
-        draw.text((28, y), ln, fill=(30, 30, 50), font=f_med)
+        
+    y = 180
+    for ln in lines[:5]:
+        draw.text((28, y), ln, fill=(60, 64, 67), font=f_med)
         y += 28
 
     thumbs = review.get("thumbsUpCount", 0)
-    draw.text((28, H-58), f"👍  {thumbs} people found this helpful", fill=(100,110,130), font=f_small)
-    draw.rounded_rectangle([W-130, H-68, W-18, H-38], radius=12, fill=(34, 197, 94))
-    draw.text((W-118, H-60), "🟢  LIVE", fill=(255, 255, 255), font=f_small)
-    draw.text((28, H-30), "Play Store Review Monitor Bot", fill=(150, 160, 180), font=f_small)
+    if thumbs > 0:
+        draw.text((28, H-40), f"{thumbs} people found this helpful", fill=(95, 99, 104), font=f_small)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
@@ -262,11 +281,11 @@ async def check_app(bot: Bot, cfg: dict, target_date: str = None):
     app_id   = cfg["app_id"]
     tg_group = cfg.get("tg_group", "")
     
-    # If no target_date is provided, use today's date
-    search_date = target_date if target_date else datetime.date.today().isoformat()
+    # BD Timezone Processed Date
+    processed_date = datetime.datetime.now(BD_TZ).date().isoformat()
     is_custom_search = target_date is not None
 
-    logger.info(f"🔍 Checking: {app_id} for date: {search_date}")
+    logger.info(f"🔍 Checking: {app_id}")
     reviews  = fetch_reviews(app_id, count=300 if is_custom_search else 50)
     app_name = get_app_name(app_id)
     
@@ -275,41 +294,46 @@ async def check_app(bot: Bot, cfg: dict, target_date: str = None):
     for review in reviews:
         rid = review.get("reviewId", "")
         content = review.get("content", "").strip()
+        user_name = review.get('userName', 'Anonymous')
         
-        # Date filtering: Only process reviews matching the search date
         rev_datetime = review.get("at")
-        if rev_datetime and rev_datetime.date().isoformat() != search_date:
+        original_date = rev_datetime.date().isoformat() if rev_datetime else processed_date
+        
+        # If it's a custom date search, strictly filter by date
+        if is_custom_search and original_date != target_date:
             continue
             
         if not rid:
             continue
 
         status = check_review_status(app_id, rid, content)
-        
-        # Ignore exactly duplicate reviews. Proceed only if NEW or UPDATED.
-        if status == "DUPLICATE":
+        if status == "DUPLICATE_ID":
             continue
 
         found_any = True
-        mark_review_seen(app_id, rid, search_date, content)
         
-        # Only increment daily count for today's normal checks
-        daily = increment_daily_count(app_id, search_date) if not is_custom_search else "N/A (Custom Search)"
+        # AI / Duplicate Check
+        is_dup_text = check_and_mark_duplicate_text(app_id, content)
+        dup_warning = "⚠️ *[WARNING: Duplicate Review Text]*\n" if is_dup_text else ""
+        update_tag = "🔄 *[Updated/Edited Review]*\n" if status == "UPDATED" else ""
+
+        shot = generate_screenshot(review, app_name)
+        imgbb_url = upload_to_imgbb(shot)
         
-        shot    = generate_screenshot(review, app_name)
+        # Save all details to Firebase for the report
+        save_full_review_data(app_id, rid, user_name, content, original_date, processed_date if not is_custom_search else target_date, imgbb_url, is_dup_text)
+        
+        daily = increment_daily_count(app_id, processed_date) if not is_custom_search else "N/A"
         summary = ai_summary(content)
 
         at_str = rev_datetime.strftime("%d %b %Y  %I:%M %p") if hasattr(rev_datetime, "strftime") else ""
 
-        # Update Notice
-        update_tag = "🔄 *[Updated/Edited Review]*\n\n" if status == "UPDATED" else ""
-
-        # ── Telegram Payload (English) ──
+        # ── Telegram Payload ──
         tg_caption = (
-            f"{update_tag}"
+            f"{dup_warning}{update_tag}"
             f"⭐⭐⭐⭐⭐ *New 5-Star Review!*\n\n"
             f"📱 *App:* `{app_name}`\n"
-            f"👤 *User:* {review.get('userName','Anonymous')}\n"
+            f"👤 *User:* {user_name}\n"
             f"🗓 *Date:* {at_str}\n\n"
             f"💬 *Review:*\n_{content[:300]}_\n\n"
             f"🤖 *AI Summary:* {summary}\n\n"
@@ -327,14 +351,12 @@ async def check_app(bot: Bot, cfg: dict, target_date: str = None):
             except TelegramError as e:
                 logger.error(f"TG error: {e}")
 
-        # ── WhatsApp / ImgBB Payload (English) ──
-        imgbb_url = upload_to_imgbb(shot)
-        
+        # ── WhatsApp Payload ──
         wa_text = (
-            f"{update_tag.replace('*', '')}"
+            f"{dup_warning.replace('*', '')}{update_tag.replace('*', '')}"
             f"⭐⭐⭐⭐⭐ *New 5-Star Review!*\n\n"
             f"📱 *App Name:* {app_name}\n"
-            f"👤 *User Name:* {review.get('userName', 'Anonymous')}\n"
+            f"👤 *User Name:* {user_name}\n"
             f"⭐ *Rating:* {int(review.get('score', 5))} Stars\n\n"
             f"💬 *Review:*\n{content[:300]}\n\n"
             f"🤖 *AI Summary:* {summary}\n\n"
@@ -349,12 +371,12 @@ async def review_check_job(context: ContextTypes.DEFAULT_TYPE):
     apps = get_all_apps()
     for cfg in apps:
         if cfg.get("active", True):
-            await check_app(context.bot, cfg) # target_date defaults to today
+            await check_app(context.bot, cfg)
 
-# ─── Daily Summary (12:01 AM for Previous Day) ────────────
+# ─── Daily Summary & File Upload (12:01 AM BD Time) ───────
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
-    # Since it runs at 00:01, we want the summary of yesterday
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    # Yesterday in BD Time
+    yesterday = (datetime.datetime.now(BD_TZ).date() - datetime.timedelta(days=1)).isoformat()
     
     for cfg in get_all_apps():
         app_id   = cfg["app_id"]
@@ -363,18 +385,57 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
         name     = get_app_name(app_id)
 
         msg = (
-            f"📊 *Daily Summary — {yesterday}*\n\n"
+            f"📊 *Daily Report — {yesterday}*\n\n"
             f"📱 *App:* {name}\n"
             f"⭐ *Total 5-Star Reviews:* {count}\n\n"
-            f"Keep up the great work! 🚀"
+            f"Attached is the detailed report file. 🚀"
         )
         
+        # Build CSV Data
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["User Name", "Original Date", "Processed Date", "Review Text", "Screenshot Link", "Is Duplicate Text?"])
+        
+        # Fetch data for this app
+        reviews_ref = db.collection("seen_reviews").where("app_id", "==", app_id).stream()
+        found_data = False
+        
+        for r in reviews_ref:
+            data = r.to_dict()
+            # Filter by processed_date == yesterday
+            if data.get("processed_date") == yesterday:
+                found_data = True
+                writer.writerow([
+                    data.get("user_name", "Anonymous"),
+                    data.get("original_date", ""),
+                    data.get("processed_date", ""),
+                    data.get("content", ""),
+                    data.get("imgbb_url", ""),
+                    "YES (Warning)" if data.get("is_duplicate_text") else "No"
+                ])
+                
+        # Send to Telegram
         if tg_group:
             try:
-                tg_msg = msg.replace(name, f"`{name}`").replace("Keep up the great work!", "_Keep up the great work!_")
-                await context.bot.send_message(tg_group, tg_msg, parse_mode="Markdown")
+                tg_msg = msg.replace(name, f"`{name}`")
+                
+                if found_data:
+                    # Convert String buffer to Bytes buffer for Telegram
+                    byte_buffer = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
+                    byte_buffer.name = f"{app_id}_report_{yesterday}.csv"
+                    
+                    await context.bot.send_document(
+                        chat_id=tg_group,
+                        document=byte_buffer,
+                        caption=tg_msg,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await context.bot.send_message(tg_group, tg_msg + "\n_(No detailed data found for yesterday)_", parse_mode="Markdown")
             except TelegramError as e:
-                pass
+                logger.error(f"Daily TG error: {e}")
+                
+        # WhatsApp Summary
         send_callmebot_wa(msg.replace("*", ""))
 
 # ─── Helpers ──────────────────────────────────────────────
@@ -396,8 +457,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     apps  = get_all_apps()
-    today = datetime.date.today().isoformat()
-    lines = [f"🟢 *Bot চালু আছে!*\n📅 {today}\n📱 অ্যাপ: {len(apps)}টি\n"]
+    today = datetime.datetime.now(BD_TZ).date().isoformat()
+    lines = [f"🟢 *Bot চালু আছে!*\n📅 {today} (BD Time)\n📱 অ্যাপ: {len(apps)}টি\n"]
     for a in apps:
         count = get_daily_count(a["app_id"], today)
         lines.append(f"• `{a['app_id']}` — আজ {count}টি রিভিউ")
@@ -430,7 +491,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Admin only.")
         return
 
-    # Main Menu Back Button Handle
     if data == "admin_main":
         kb = [
             [InlineKeyboardButton("➕ অ্যাপ যোগ করুন",    callback_data="admin_add")],
@@ -439,11 +499,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔍 নির্দিষ্ট অ্যাপ চেক",   callback_data="admin_check_menu")],
             [InlineKeyboardButton("📅 নির্দিষ্ট তারিখ সার্চ", callback_data="admin_search_menu")],
         ]
-        await q.edit_message_text(
-            "🛡 *Admin প্যানেল*\nএকটি অপশন বেছে নিন:",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
+        await q.edit_message_text("🛡 *Admin প্যানেল*\nএকটি অপশন বেছে নিন:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
     if data == "admin_add":
@@ -475,14 +531,9 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = ["📋 *মনিটরড অ্যাপসমূহ:*\n"]
         for a in apps:
-            lines.append(
-                f"• `{a['app_id']}`\n"
-                f"  📢 TG: `{a.get('tg_group','—')}`\n"
-                f"  💬 WA: `{a.get('wa_link','—')}`"
-            )
+            lines.append(f"• `{a['app_id']}`\n  📢 TG: `{a.get('tg_group','—')}`\n  💬 WA: `{a.get('wa_link','—')}`")
         await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
 
-    # --- Individual App Check System ---
     elif data == "admin_check_menu":
         apps = get_all_apps()
         if not apps:
@@ -494,20 +545,18 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("chk_"):
         app_id = data[4:]
-        await q.edit_message_text(f"⏳ `{app_id}` এর আজকের নতুন রিভিউ চেক করা হচ্ছে...", parse_mode="Markdown")
-        
+        await q.edit_message_text(f"⏳ `{app_id}` এর নতুন রিভিউ চেক করা হচ্ছে...", parse_mode="Markdown")
         apps = get_all_apps()
         cfg = next((item for item in apps if item["app_id"] == app_id), None)
         if cfg:
-            found = await check_app(context.bot, cfg) # Checks for today by default
+            found = await check_app(context.bot, cfg)
             if found:
                 await q.edit_message_text(f"✅ `{app_id}` এর নতুন রিভিউ সফলভাবে গ্রুপে পাঠানো হয়েছে।", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
             else:
-                await q.edit_message_text(f"ℹ️ `{app_id}` এ আজকে নতুন কোনো রিভিউ পাওয়া যায়নি।", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
+                await q.edit_message_text(f"ℹ️ `{app_id}` এ নতুন কোনো রিভিউ পাওয়া যায়নি।", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
         else:
             await q.edit_message_text("❌ অ্যাপটি খুঁজে পাওয়া যায়নি।", reply_markup=InlineKeyboardMarkup([get_back_kb()]))
 
-    # --- Specific Date Search System ---
     elif data == "admin_search_menu":
         apps = get_all_apps()
         if not apps:
@@ -533,11 +582,10 @@ async def conv_search_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = update.message.text.strip()
     app_id = context.user_data.get("search_app")
     
-    # Simple Date Format validation
     try:
         datetime.datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
-        await update.message.reply_text("❌ তারিখের ফরম্যাট ভুল! দয়া করে `YYYY-MM-DD` ফরম্যাটে লিখুন (যেমন: 2024-05-20)। /cancel দিয়ে বের হতে পারেন।")
+        await update.message.reply_text("❌ তারিখের ফরম্যাট ভুল! দয়া করে `YYYY-MM-DD` ফরম্যাটে লিখুন। /cancel দিয়ে বের হতে পারেন।")
         return WAITING_SEARCH_DATE
 
     await update.message.reply_text(f"⏳ `{app_id}` এর `{date_str}` তারিখের রিভিউ খোঁজা হচ্ছে...", parse_mode="Markdown")
@@ -588,8 +636,8 @@ async def conv_wa_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📱 App ID: `{app_id}`\n"
         f"📢 Telegram Group: `{tg_group}`\n"
         f"💬 WA Link Saved: `{wa_link}`\n\n"
-        f"✅ বট এখন থেকে শুধু **আজকের** নতুন ৫★ রিভিউগুলো Telegram এবং আপনার কনফিগার করা WhatsApp নাম্বারে পাঠাবে।\n\n"
-        f"*(নোট: CallMeBot API সরাসরি গ্রুপ লিংকে মেসেজ পাঠাতে পারে না, এটি আপনার সংযুক্ত পার্সোনাল নাম্বারে মেসেজটি পাঠাবে। লিংকটি ডাটাবেসে সেভ রাখা হয়েছে ভবিষ্যতের আপডেটের জন্য।)*",
+        f"✅ বট এখন থেকে নতুন ৫★ রিভিউগুলো Telegram এবং আপনার কনফিগার করা WhatsApp নাম্বারে পাঠাবে।\n\n"
+        f"*(নোট: CallMeBot API সরাসরি গ্রুপ লিংকে মেসেজ পাঠাতে পারে না, এটি পার্সোনাল নাম্বারে পাঠাবে। লিংকটি ভবিষ্যতের আপডেটের জন্য সেভ রাখা হলো।)*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([get_back_kb()])
     )
@@ -612,7 +660,6 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Conversation: Manage States
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(admin_cb, pattern="^admin_add$"),
@@ -636,10 +683,10 @@ def main():
     app.add_error_handler(error_handler)
 
     jq = app.job_queue
-    # 5 minutes auto check
     jq.run_repeating(review_check_job, interval=300, first=30, name="review_check")
-    # Daily summary exactly at 12:01 AM (00:01:00)
-    jq.run_daily(daily_summary_job, time=datetime.time(0, 1, 0), name="daily_summary")
+    
+    # Run daily report at exactly 12:01 AM (Bangladesh Time)
+    jq.run_daily(daily_summary_job, time=datetime.time(0, 1, 0, tzinfo=BD_TZ), name="daily_summary")
 
     logger.info("✅ Bot polling শুরু হয়েছে!")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
